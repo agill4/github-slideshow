@@ -1,0 +1,379 @@
+//@version=6
+indicator("Multi-Timeframe Order Block Inventory", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500)
+
+// === Inputs ===
+parentTF = input.timeframe("60", "Parent (Inventory) Timeframe")
+childTF  = input.timeframe("15", "Child (Refinement) Timeframe")
+maxParentPerSide = input.int(3, "Max Parent OBs Per Side", minval=1, maxval=5)
+parentPivotLen = input.int(3, "1H Swing Pivot Length", minval=1, maxval=10)
+childPivotLen  = input.int(2, "15m Swing Pivot Length", minval=1, maxval=10)
+searchLookback = input.int(6, "OB Search Lookback", minval=1, maxval=12)
+atrDisplacementMult = input.float(1.0, "Displacement ATR Threshold", minval=0.5, maxval=5.0, step=0.1)
+refineAtrBuffer = input.float(0.25, "Refined Zone ATR Buffer", minval=0.0, maxval=1.0, step=0.05)
+freshWindowDays = input.int(5, "Freshness Window (days)", minval=1, maxval=10)
+
+msInDay = 24 * 60 * 60 * 1000
+
+// === Type Definitions ===
+type OrderBlock
+    int    dir
+    int    barTime
+    float  hi
+    float  lo
+    float  opn
+    float  cls
+    float  baseScore
+    bool   fresh
+    bool   timeBonus
+    bool   mitigated
+    float  swingLow
+    float  swingHigh
+    float  mid
+    float  refinedHigh
+    float  refinedLow
+    float  entry
+    float  invalidation
+    bool   hasRefined
+    bool   strongDisplacement
+    bool   hasFVG
+    bool   hasSweep
+    bool   inOptimal
+
+OrderBlock_new(int dir, int barTime, float hi, float lo, float opn, float cls, float baseScore, bool fresh, bool timeBonus, bool mitigated, float swingLow, float swingHigh, bool strongDisplacement, bool hasFVG, bool hasSweep, bool inOptimal) =>
+    OrderBlock.new(dir, barTime, hi, lo, opn, cls, baseScore, fresh, timeBonus, mitigated, swingLow, swingHigh, (hi + lo) / 2.0, na, na, na, na, false, strongDisplacement, hasFVG, hasSweep, inOptimal)
+
+type ChildOB
+    int dir
+    int barTime
+    float hi
+    float lo
+    float bodyHigh
+    float bodyLow
+    float atrBuffer
+    bool liquidityEvent
+
+ChildOB_new(int dir, int barTime, float hi, float lo, float bodyHigh, float bodyLow, float atrBuffer, bool liquidityEvent) =>
+    ChildOB.new(dir, barTime, hi, lo, bodyHigh, bodyLow, atrBuffer, liquidityEvent)
+
+// === Helper Functions ===
+priceSpan(float hi, float lo) => hi - lo
+
+parentScore(OrderBlock ob) =>
+    ob.baseScore + (ob.fresh ? 1.0 : 0.0) + (ob.timeBonus ? 1.0 : 0.0)
+
+updateTimeBonus(array<OrderBlock> arr) =>
+    for i = 0 to array.size(arr) - 1
+        ob = array.get(arr, i)
+        ob.timeBonus := (time - ob.barTime) <= freshWindowDays * msInDay
+        array.set(arr, i, ob)
+
+markMitigations(array<OrderBlock> arr) =>
+    for i = 0 to array.size(arr) - 1
+        ob = array.get(arr, i)
+        if not ob.mitigated
+            if ob.dir == 1
+                tapped = low <= ob.hi
+                crossed = close >= ob.mid and close[1] < ob.mid
+                if tapped and crossed
+                    ob.mitigated := true
+                    ob.fresh := false
+            else
+                tapped = high >= ob.lo
+                crossed = close <= ob.mid and close[1] > ob.mid
+                if tapped and crossed
+                    ob.mitigated := true
+                    ob.fresh := false
+        array.set(arr, i, ob)
+
+trimToLimit(array<OrderBlock> arr, int limit) =>
+    while array.size(arr) > limit
+        lowestIdx = 0
+        lowestScore = parentScore(array.get(arr, 0))
+        for i = 1 to array.size(arr) - 1
+            s = parentScore(array.get(arr, i))
+            if s < lowestScore
+                lowestScore := s
+                lowestIdx := i
+        array.remove(arr, lowestIdx)
+
+sortByScore(array<OrderBlock> arr) =>
+    for i = 0 to array.size(arr) - 2
+        maxIdx = i
+        maxScore = parentScore(array.get(arr, i))
+        for j = i + 1 to array.size(arr) - 1
+            score = parentScore(array.get(arr, j))
+            if score > maxScore
+                maxScore := score
+                maxIdx := j
+        if maxIdx != i
+            current = array.get(arr, i)
+            swap = array.get(arr, maxIdx)
+            array.set(arr, i, swap)
+            array.set(arr, maxIdx, current)
+
+rangesOverlap(float aLow, float aHigh, float bLow, float bHigh) =>
+    math.max(aLow, bLow) <= math.min(aHigh, bHigh)
+
+refineWithChild(array<OrderBlock> parents, array<ChildOB> childs) =>
+    for i = 0 to array.size(parents) - 1
+        ob = array.get(parents, i)
+        parentRange = priceSpan(ob.hi, ob.lo)
+        if parentRange == 0
+            continue
+        parent40 = ob.dir == 1 ? ob.lo + parentRange * 0.4 : ob.hi - parentRange * 0.4
+        parent70 = ob.dir == 1 ? ob.lo + parentRange * 0.7 : ob.hi - parentRange * 0.7
+        parentZoneLow = math.min(parent40, parent70)
+        parentZoneHigh = math.max(parent40, parent70)
+        float bestScore = na
+        ChildOB bestChild = na
+        for j = 0 to array.size(childs) - 1
+            child = array.get(childs, j)
+            if child.dir != ob.dir or child.barTime < ob.barTime
+                continue
+            insideParent = child.hi <= ob.hi and child.lo >= ob.lo
+            if not insideParent
+                continue
+            childRange = priceSpan(child.hi, child.lo)
+            if childRange == 0
+                continue
+            child50 = ob.dir == 1 ? child.lo + childRange * 0.5 : child.hi - childRange * 0.5
+            child80 = ob.dir == 1 ? child.lo + childRange * 0.8 : child.hi - childRange * 0.8
+            childZoneLow = math.min(child50, child80)
+            childZoneHigh = math.max(child50, child80)
+            if not rangesOverlap(parentZoneLow, parentZoneHigh, childZoneLow, childZoneHigh)
+                continue
+            if not child.liquidityEvent
+                continue
+            parentMid = (ob.hi + ob.lo) * 0.5
+            childMid = (child.hi + child.lo) * 0.5
+            dist = math.abs(childMid - parentMid) / parentRange
+            candidateScore = (child.liquidityEvent ? 1.0 : 0.0) + (1.0 - math.min(dist, 1.0))
+            if na(bestScore) or candidateScore > bestScore
+                bestScore := candidateScore
+                bestChild := child
+        if not na(bestScore)
+            buffer = bestChild.atrBuffer * refineAtrBuffer
+            if ob.dir == 1
+                refinedLow = math.max(ob.lo, bestChild.bodyLow - buffer)
+                refinedHigh = math.min(ob.hi, bestChild.bodyHigh + buffer)
+                entry = (refinedLow + refinedHigh) * 0.5
+                invalid = bestChild.lo
+            else
+                refinedHigh = math.min(ob.hi, bestChild.bodyHigh + buffer)
+                refinedLow = math.max(ob.lo, bestChild.bodyLow - buffer)
+                entry = (refinedLow + refinedHigh) * 0.5
+                invalid = bestChild.hi
+            ob.refinedLow := refinedLow
+            ob.refinedHigh := refinedHigh
+            ob.entry := entry
+            ob.invalidation := invalid
+            ob.hasRefined := true
+            array.set(parents, i, ob)
+
+// === Higher Timeframe Calculations ===
+calcParentOB(int dir) =>
+    var float lastSwingHigh = na
+    var float lastSwingLow = na
+    var int lastSwingHighBar = na
+    var int lastSwingLowBar = na
+    pivotHigh = ta.pivothigh(high, parentPivotLen, parentPivotLen)
+    pivotLow = ta.pivotlow(low, parentPivotLen, parentPivotLen)
+    if not na(pivotHigh)
+        lastSwingHigh := pivotHigh
+        lastSwingHighBar := bar_index - parentPivotLen
+    if not na(pivotLow)
+        lastSwingLow := pivotLow
+        lastSwingLowBar := bar_index - parentPivotLen
+    atrVal = ta.atr(14)
+    bosUp = dir == 1 and not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+    bosDown = dir == -1 and not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow
+    newOb = bosUp or bosDown
+    idx = na
+    if newOb
+        for look = 1 to searchLookback
+            bearCandle = close[look] < open[look]
+            bullCandle = close[look] > open[look]
+            if dir == 1 and bearCandle
+                idx := look
+                break
+            if dir == -1 and bullCandle
+                idx := look
+                break
+    float obOpen = na
+    float obHigh = na
+    float obLow = na
+    float obClose = na
+    float baseScore = 0.0
+    bool strong = false
+    bool fvg = false
+    bool sweep = false
+    bool optimal = false
+    float swingAnchorLow = na
+    float swingAnchorHigh = na
+    if not na(idx)
+        obOpen := open[idx]
+        obHigh := high[idx]
+        obLow := low[idx]
+        obClose := close[idx]
+        strong := dir == 1 ? (close - open) >= atrVal * atrDisplacementMult : (open - close) >= atrVal * atrDisplacementMult
+        baseScore += strong ? 1.0 : 0.0
+        fvg := dir == 1 ? low > high[1] : high < low[1]
+        baseScore += fvg ? 1.0 : 0.0
+        if dir == 1
+            sweepHigh = ta.highest(high[1], parentPivotLen * 2)
+            sweep := not na(lastSwingHigh) and math.abs(sweepHigh - lastSwingHigh) <= syminfo.mintick * 2
+            swingAnchorLow := lastSwingLow
+            swingAnchorHigh := lastSwingHigh
+        else
+            sweepLow = ta.lowest(low[1], parentPivotLen * 2)
+            sweep := not na(lastSwingLow) and math.abs(sweepLow - lastSwingLow) <= syminfo.mintick * 2
+            swingAnchorLow := lastSwingLow
+            swingAnchorHigh := lastSwingHigh
+        baseScore += sweep ? 1.0 : 0.0
+        if not na(swingAnchorLow) and not na(swingAnchorHigh) and swingAnchorHigh != swingAnchorLow
+            parentRange = swingAnchorHigh - swingAnchorLow
+            obMid = (obHigh + obLow) * 0.5
+            position = (obMid - swingAnchorLow) / parentRange
+            optimal := dir == 1 ? position < 0.5 : position > 0.5
+            baseScore += optimal ? 1.0 : 0.0
+    [newOb and not na(idx) ? 1 : 0, time[idx], obOpen, obHigh, obLow, obClose, baseScore, strong, fvg, sweep, optimal, swingAnchorLow, swingAnchorHigh]
+
+[isNewBull, bullTime, bullOpen, bullHigh, bullLow, bullClose, bullBaseScore, bullStrong, bullFvg, bullSweep, bullOptimal, bullSwingLow, bullSwingHigh] = request.security(syminfo.tickerid, parentTF, calcParentOB(1), lookahead=barmerge.lookahead_off)
+[isNewBear, bearTime, bearOpen, bearHigh, bearLow, bearClose, bearBaseScore, bearStrong, bearFvg, bearSweep, bearOptimal, bearSwingLow, bearSwingHigh] = request.security(syminfo.tickerid, parentTF, calcParentOB(-1), lookahead=barmerge.lookahead_off)
+
+// === Child Timeframe Calculations ===
+calcChildOB() =>
+    var float lastSwingHigh = na
+    var float lastSwingLow = na
+    pivotHigh = ta.pivothigh(high, childPivotLen, childPivotLen)
+    pivotLow = ta.pivotlow(low, childPivotLen, childPivotLen)
+    if not na(pivotHigh)
+        lastSwingHigh := pivotHigh
+    if not na(pivotLow)
+        lastSwingLow := pivotLow
+    atrVal = ta.atr(14)
+    bosUp = not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+    bosDown = not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow
+    dir = bosUp ? 1 : bosDown ? -1 : 0
+    idx = na
+    if dir != 0
+        for look = 1 to searchLookback
+            bearCandle = close[look] < open[look]
+            bullCandle = close[look] > open[look]
+            if dir == 1 and bearCandle
+                idx := look
+                break
+            if dir == -1 and bullCandle
+                idx := look
+                break
+    float obHigh = na
+    float obLow = na
+    float bodyHigh = na
+    float bodyLow = na
+    bool liqEvent = false
+    if not na(idx)
+        obHigh := high[idx]
+        obLow := low[idx]
+        bodyHigh := math.max(open[idx], close[idx])
+        bodyLow := math.min(open[idx], close[idx])
+        fvg = dir == 1 ? low > high[1] : high < low[1]
+        sweep = dir == 1 ? (ta.lowest(low[1], childPivotLen * 2) < low[idx]) : (ta.highest(high[1], childPivotLen * 2) > high[idx])
+        liqEvent := fvg or sweep
+    [dir != 0 and not na(idx) ? 1 : 0, dir, time[idx], obHigh, obLow, bodyHigh, bodyLow, atrVal, liqEvent]
+
+[newChild, childDir, childTime, childHigh, childLow, childBodyHigh, childBodyLow, childAtr, childLiquidity] = request.security(syminfo.tickerid, childTF, calcChildOB(), lookahead=barmerge.lookahead_off)
+
+// === Persistent Storage ===
+var array<OrderBlock> bullOBs = array.new<OrderBlock>()
+var array<OrderBlock> bearOBs = array.new<OrderBlock>()
+var array<ChildOB> childOBs = array.new<ChildOB>()
+
+if newChild > 0
+    child = ChildOB_new(int(childDir), int(childTime), childHigh, childLow, childBodyHigh, childBodyLow, childAtr, childLiquidity)
+    array.push(childOBs, child)
+    if array.size(childOBs) > 100
+        array.shift(childOBs)
+
+if isNewBull > 0
+    baseScore = nz(bullBaseScore)
+    newOb = OrderBlock_new(1, int(bullTime), bullHigh, bullLow, bullOpen, bullClose, baseScore, true, true, false, bullSwingLow, bullSwingHigh, bullStrong, bullFvg, bullSweep, bullOptimal)
+    array.push(bullOBs, newOb)
+    trimToLimit(bullOBs, maxParentPerSide)
+
+if isNewBear > 0
+    baseScore = nz(bearBaseScore)
+    newOb = OrderBlock_new(-1, int(bearTime), bearHigh, bearLow, bearOpen, bearClose, baseScore, true, true, false, bearSwingLow, bearSwingHigh, bearStrong, bearFvg, bearSweep, bearOptimal)
+    array.push(bearOBs, newOb)
+    trimToLimit(bearOBs, maxParentPerSide)
+
+updateTimeBonus(bullOBs)
+updateTimeBonus(bearOBs)
+markMitigations(bullOBs)
+markMitigations(bearOBs)
+refineWithChild(bullOBs, childOBs)
+refineWithChild(bearOBs, childOBs)
+sortByScore(bullOBs)
+sortByScore(bearOBs)
+
+// === Plotting Utilities ===
+var array<box> bullParentBoxes = array.new<box>()
+var array<box> bearParentBoxes = array.new<box>()
+var array<label> bullLabels = array.new<label>()
+var array<label> bearLabels = array.new<label>()
+var array<box> bullRefinedBoxes = array.new<box>()
+var array<box> bearRefinedBoxes = array.new<box>()
+var array<line> bullEntryLines = array.new<line>()
+var array<line> bearEntryLines = array.new<line>()
+var array<line> bullInvalidLines = array.new<line>()
+var array<line> bearInvalidLines = array.new<line>()
+
+clearBoxes(array<box> arr) =>
+    while array.size(arr) > 0
+        b = array.pop(arr)
+        box.delete(b)
+
+clearLabels(array<label> arr) =>
+    while array.size(arr) > 0
+        l = array.pop(arr)
+        label.delete(l)
+
+clearLines(array<line> arr) =>
+    while array.size(arr) > 0
+        ln = array.pop(arr)
+        line.delete(ln)
+
+parentColor(int dir) => dir == 1 ? color.new(color.green, 80) : color.new(color.red, 80)
+refinedColor(int dir) => dir == 1 ? color.new(color.green, 30) : color.new(color.red, 30)
+
+renderOBs(array<OrderBlock> arr, array<box> parentBoxes, array<box> refinedBoxes, array<label> labels, array<line> entryLines, array<line> invalidLines) =>
+    clearBoxes(parentBoxes)
+    clearBoxes(refinedBoxes)
+    clearLabels(labels)
+    clearLines(entryLines)
+    clearLines(invalidLines)
+    for i = 0 to array.size(arr) - 1
+        ob = array.get(arr, i)
+        parentBox = box.new(bar_index, ob.hi, bar_index + 1, ob.lo, xloc=xloc.bar_index, border_color=color.new(color.white, 0), bgcolor=parentColor(ob.dir))
+        box.set_extend(parentBox, extend.right)
+        array.push(parentBoxes, parentBox)
+        scoreText = str.tostring(math.round(parentScore(ob), 2))
+        status = ob.mitigated ? "Mitigated" : "Unmitigated"
+        detail = "S:" + (ob.strongDisplacement ? "Y" : "N") + " F:" + (ob.hasFVG ? "Y" : "N") + " L:" + (ob.hasSweep ? "Y" : "N") + " O:" + (ob.inOptimal ? "Y" : "N")
+        lbl = label.new(bar_index, ob.mid, "Score " + scoreText + "\n" + status + "\n" + detail, xloc=xloc.bar_index, style=label.style_label_left, color=color.new(color.black, 0), textcolor=color.white)
+        array.push(labels, lbl)
+        if ob.hasRefined and not na(ob.refinedHigh) and not na(ob.refinedLow)
+            refinedBox = box.new(bar_index, ob.refinedHigh, bar_index + 1, ob.refinedLow, xloc=xloc.bar_index, border_color=color.new(color.white, 80), bgcolor=refinedColor(ob.dir))
+            box.set_extend(refinedBox, extend.right)
+            array.push(refinedBoxes, refinedBox)
+            linecolor = ob.dir == 1 ? color.lime : color.maroon
+            entryLine = line.new(bar_index, ob.entry, bar_index + 1, ob.entry, xloc=xloc.bar_index, extend=extend.right, color=linecolor, width=2)
+            invalidLine = line.new(bar_index, ob.invalidation, bar_index + 1, ob.invalidation, xloc=xloc.bar_index, extend=extend.right, color=color.new(linecolor, 70), style=line.style_dashed)
+            array.push(entryLines, entryLine)
+            array.push(invalidLines, invalidLine)
+
+renderOBs(bullOBs, bullParentBoxes, bullRefinedBoxes, bullLabels, bullEntryLines, bullInvalidLines)
+renderOBs(bearOBs, bearParentBoxes, bearRefinedBoxes, bearLabels, bearEntryLines, bearInvalidLines)
+
+// Plot midpoint for quick view
+plotshape(array.size(bullOBs) > 0 ? array.get(bullOBs, 0).mid : na, title="Top Bullish OB Midpoint", style=shape.triangleup, location=location.absolute, color=color.lime, size=size.tiny)
+plotshape(array.size(bearOBs) > 0 ? array.get(bearOBs, 0).mid : na, title="Top Bearish OB Midpoint", style=shape.triangledown, location=location.absolute, color=color.red, size=size.tiny)
